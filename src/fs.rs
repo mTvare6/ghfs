@@ -20,13 +20,24 @@ const TTL: Duration = Duration::from_secs(1);
 struct File {
     size: u64,
     url: String,
-    cache: OnceCell<Vec<u8>>,
+    cache: Arc<OnceCell<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone)]
 struct Dir {
     files: HashMap<String, u64>,
     name: String,
+    kind: DirKind,
+    parent: u64,
+    hydrated: bool,
+}
+
+#[derive(Debug, Clone)]
+enum DirKind {
+    Root,
+    Standard,
+    Repo { owner: String, branch: String },
+    User,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +92,7 @@ impl Node {
 }
 
 impl File {
-    async fn content(&self, client: Client) -> Result<&[u8], Errno> {
+    async fn content(&self, client: &Client) -> Result<&[u8], Errno> {
         let bytes = self
             .cache
             .get_or_try_init(|| async {
@@ -117,10 +128,15 @@ impl GithubFS {
     pub fn new() -> Self {
         let mut nodes = HashMap::new();
         let name = String::from("/tmp/github");
+        let kind = DirKind::Root;
+        let parent = Self::ROOT;
 
         let root = Dir {
             name,
+            kind,
+            parent,
             files: HashMap::new(),
+            hydrated: true, // never checked
         };
 
         let root = Node::Dir(root);
@@ -135,6 +151,7 @@ impl GithubFS {
         if let Ok(token) = std::env::var("GITHUB_TOKEN") {
             let auth_value = format!("Bearer {}", token);
             headers.insert("Authorization", auth_value.parse().unwrap());
+            println!("Using github token: {}", token);
         }
 
         let client = ClientBuilder::new()
@@ -179,7 +196,7 @@ impl GithubFS {
         id
     }
 
-    async fn add_dir(&mut self, parent: u64, dir_name: String, dir: Dir) -> u64 {
+    async fn add_dir(&self, parent: u64, dir_name: String, dir: Dir) -> u64 {
         let node = Node::Dir(dir);
         let dir = self.insert(node).await;
 
@@ -192,17 +209,20 @@ impl GithubFS {
         dir
     }
 
-    async fn new_dir(&mut self, parent: u64, dir_name: String) -> u64 {
+    async fn new_dir(&self, parent: u64, dir_name: String, kind: DirKind, hydrated: bool) -> u64 {
         let name = dir_name.clone();
         let dir = Dir {
             name,
+            parent,
+            kind,
             files: HashMap::new(),
+            hydrated,
         };
 
         self.add_dir(parent, dir_name, dir).await
     }
 
-    async fn add_file(&mut self, parent: u64, file_name: String, file: File) -> u64 {
+    async fn add_file(&self, parent: u64, file_name: String, file: File) -> u64 {
         let node = Node::File(file);
         let file = self.insert(node).await;
 
@@ -215,9 +235,7 @@ impl GithubFS {
         file
     }
 
-    pub async fn add_repo(&mut self, response: GithubTreeResponse, author: String, repo: String) {
-        let author = self.new_dir(1, author).await;
-        let repo = self.new_dir(author, repo).await;
+    pub async fn add_repo(&self, response: GithubTreeResponse, repo: u64) {
         for node in response.tree {
             match node.node_type {
                 GithubNodeType::Blob => {
@@ -226,7 +244,7 @@ impl GithubFS {
                     let (parent, file_name) =
                         self.get_parent_and_node(repo, file_path).await.unwrap();
                     let url = node.url;
-                    let cache = OnceCell::new();
+                    let cache = Arc::new(OnceCell::new());
                     let file = File { size, url, cache };
                     self.add_file(parent, file_name, file).await;
                 }
@@ -234,7 +252,8 @@ impl GithubFS {
                     let file_path = node.path;
                     let (parent, dir_name) =
                         self.get_parent_and_node(repo, file_path).await.unwrap();
-                    self.new_dir(parent, dir_name).await;
+                    self.new_dir(parent, dir_name, DirKind::Standard, true)
+                        .await;
                 }
             }
         }
@@ -259,9 +278,20 @@ pub struct GithubNode {
 
 #[derive(Deserialize)]
 pub struct GithubTreeResponse {
-    pub sha: String,
-    pub url: String,
     pub tree: Vec<GithubNode>,
+}
+
+#[derive(Deserialize)]
+pub struct GithubRepoResponse {
+    pub name: String,
+    pub owner: GithubOwner,
+    #[serde(rename = "default_branch")]
+    pub branch: String,
+}
+
+#[derive(Deserialize)]
+pub struct GithubOwner {
+    pub login: String,
 }
 
 #[async_trait::async_trait]
@@ -272,18 +302,50 @@ impl AsyncFilesystem for GithubFS {
         parent: INodeNo,
         name: &OsStr,
     ) -> fuser::experimental::Result<LookupResponse> {
-        let map = self.nodes.read().await;
-        let Some(Node::Dir(dir)) = map.get(&parent.0) else {
-            return Err(Errno::ENOENT);
-        };
-
         let name_str = name.to_str().ok_or(Errno::EINVAL)?;
-        let file_ino = dir.files.get(name_str).ok_or(Errno::ENOENT)?;
+        {
+            let map = self.nodes.read().await;
 
-        let node = map.get(file_ino).ok_or(Errno::ENOENT)?;
-        let attr = node.attr(*file_ino);
+            let Some(Node::Dir(dir)) = map.get(&parent.0) else {
+                return Err(Errno::ENOENT);
+            };
 
-        Ok(LookupResponse::new(TTL, attr, fuser::Generation(0)))
+            if let Some(file_ino) = dir.files.get(name_str) {
+                let node = map.get(file_ino).unwrap();
+                let attr = node.attr(*file_ino);
+
+                return Ok(LookupResponse::new(TTL, attr, fuser::Generation(0)));
+            }
+        }
+
+        if parent.0 == GithubFS::ROOT {
+            let user = format!("https://api.github.com/users/{}", name_str);
+            let response = self
+                .client
+                .get(&user)
+                .send()
+                .await
+                .map_err(|_| Errno::EIO)?;
+
+            if response.status().is_success() {
+                let new_id = self
+                    .new_dir(parent.0, name_str.into(), DirKind::User, false)
+                    .await;
+
+                let map = self.nodes.read().await;
+                let node = map.get(&new_id).unwrap();
+
+                return Ok(LookupResponse::new(
+                    TTL,
+                    node.attr(new_id),
+                    fuser::Generation(0),
+                ));
+            } else {
+                return Err(Errno::ENOENT);
+            }
+        }
+
+        Err(Errno::ENOENT)
     }
 
     async fn getattr(
@@ -323,7 +385,7 @@ impl AsyncFilesystem for GithubFS {
         // preventing rwlock from hanging the whole fs when content is being downloaded, so
         // hashmap is lock-free by then
 
-        let content = file.content(self.client.clone()).await?;
+        let content = file.content(&self.client).await?;
 
         let offset = offset as usize;
         if offset < content.len() {
@@ -341,15 +403,58 @@ impl AsyncFilesystem for GithubFS {
         offset: u64,
         mut builder: DirEntListBuilder<'_>,
     ) -> fuser::experimental::Result<()> {
+        let (kind, hydrated, name, parent) = {
+            let map = self.nodes.read().await;
+            let Some(Node::Dir(dir)) = map.get(&ino.0) else {
+                return Err(Errno::ENOTDIR);
+            };
+            (dir.kind.clone(), dir.hydrated, dir.name.clone(), dir.parent)
+        };
+
+        if !hydrated {
+            match kind {
+                DirKind::User => {
+                    let url = format!("https://api.github.com/users/{}/repos?per_page=100", name);
+                    let response = self.client.get(&url).send().await.map_err(|_| Errno::EIO)?;
+                    let repos: Vec<GithubRepoResponse> =
+                        response.json().await.map_err(|_| Errno::EIO)?;
+
+                    for repo in repos {
+                        let kind = DirKind::Repo {
+                            owner: repo.owner.login,
+                            branch: repo.branch,
+                        };
+                        let name = repo.name;
+                        self.new_dir(ino.0, name, kind, false).await;
+                    }
+                }
+                DirKind::Repo { owner, branch } => {
+                    let url = format!(
+                        "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
+                        owner, name, branch
+                    );
+                    let response = self.client.get(&url).send().await.map_err(|_| Errno::EIO)?;
+                    let tree: GithubTreeResponse = response.json().await.map_err(|_| Errno::EIO)?;
+                    self.add_repo(tree, ino.0).await;
+                }
+                _ => {}
+            }
+
+            let mut mmap = self.nodes.write().await;
+            if let Some(Node::Dir(dir)) = mmap.get_mut(&ino.0) {
+                dir.hydrated = true;
+            }
+        }
+
+        let mut entries = vec![
+            (ino.0, FileType::Directory, ".".to_string()),
+            (parent, FileType::Directory, "..".to_string()), // hardcoding parent to root
+        ];
+
         let map = self.nodes.read().await;
         let Some(Node::Dir(dir)) = map.get(&ino.0) else {
             return Err(Errno::ENOTDIR);
         };
-
-        let mut entries = vec![
-            (ino.0, FileType::Directory, ".".to_string()),
-            (1, FileType::Directory, "..".to_string()), // hardcoding parent to root
-        ];
 
         for (child_name, child_ino) in &dir.files {
             let child_node = map.get(child_ino).unwrap();
