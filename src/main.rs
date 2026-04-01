@@ -5,7 +5,8 @@ use fuser::{MountOption, SessionACL};
 
 use fs::{GithubFS, GithubTreeResponse};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     env_logger::init();
     let mountpoint = "/tmp/github";
 
@@ -23,7 +24,7 @@ fn main() {
     let payload: GithubTreeResponse = serde_json::from_str(&response).unwrap();
 
     let mut ghfs = GithubFS::new();
-    ghfs.add_repo(payload, "mTvare6".into(), "hello-world.rs".into());
+    ghfs.add_repo(payload, "mTvare6".into(), "hello-world.rs".into()).await;
 
     fuser::mount2(TokioAdapter::new(ghfs), mountpoint, &config).unwrap();
 }
