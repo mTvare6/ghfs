@@ -1,32 +1,89 @@
+use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-#[derive(Debug)]
-struct Cache;
+use std::ffi::OsStr;
+use std::time::{Duration, UNIX_EPOCH};
 
-impl Cache {
-    fn new() -> Self {
-        Self {}
-    }
-}
+use fuser::experimental::{
+    AsyncFilesystem, DirEntListBuilder, GetAttrResponse, LookupResponse, RequestContext,
+};
 
-#[derive(Debug)]
+use fuser::{Errno, FileAttr, FileHandle, FileType, INodeNo, LockOwner, OpenFlags};
+
+const TTL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone)]
 struct File {
     size: u64,
     url: String,
-    cache: Cache,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Dir {
     files: HashMap<String, u64>,
     name: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Node {
     File(File),
     Dir(Dir),
+}
+
+impl Node {
+    fn attr(&self, ino: u64) -> FileAttr {
+        let ino = INodeNo(ino);
+        match self {
+            Node::Dir(_) => FileAttr {
+                ino,
+                size: 0,
+                blocks: 0,
+                atime: UNIX_EPOCH,
+                mtime: UNIX_EPOCH,
+                ctime: UNIX_EPOCH,
+                crtime: UNIX_EPOCH,
+                kind: FileType::Directory,
+                perm: 0o755,
+                nlink: 2,
+                uid: 501,
+                gid: 20,
+                rdev: 0,
+                flags: 0,
+                blksize: 512,
+            },
+            Node::File(file) => {
+                let size = file.size;
+                FileAttr {
+                    ino,
+                    size,
+                    blocks: 1,
+                    atime: UNIX_EPOCH,
+                    mtime: UNIX_EPOCH,
+                    ctime: UNIX_EPOCH,
+                    crtime: UNIX_EPOCH,
+                    kind: FileType::RegularFile,
+                    perm: 0o444,
+                    nlink: 1,
+                    uid: 501,
+                    gid: 20,
+                    rdev: 0,
+                    flags: 0,
+                    blksize: 512,
+                }
+            }
+        }
+    }
+
+    fn content(&self) -> Option<String> {
+        match self {
+            Self::Dir(_) => None,
+            Self::File(file) => {
+                let string = "Test".to_string();
+                Some(string)
+            }
+        }
+    }
 }
 
 pub struct GithubFS {
@@ -55,7 +112,7 @@ impl GithubFS {
             .map(|parent| (parent, String::from(file_name)))
     }
 
-    fn new() -> Self {
+    pub fn new() -> Self {
         let mut nodes = HashMap::new();
         let name = String::from("/tmp/github");
         let root = Dir {
@@ -102,7 +159,7 @@ impl GithubFS {
         file
     }
 
-    fn add_repo(&mut self, response: GithubTreeResponse, author: String, repo: String) {
+    pub fn add_repo(&mut self, response: GithubTreeResponse, author: String, repo: String) {
         let author = self.new_dir(1, author);
         let repo = self.new_dir(author, repo);
         for node in response.tree {
@@ -112,8 +169,7 @@ impl GithubFS {
                     let file_path = node.path;
                     let (parent, file_name) = self.get_parent_and_node(repo, file_path).unwrap();
                     let url = node.url;
-                    let cache = Cache::new();
-                    let file = File { size, url, cache };
+                    let file = File { size, url, };
                     self.add_file(parent, file_name, file);
                 }
                 GithubNodeType::Tree => {
@@ -152,12 +208,104 @@ pub struct GithubTreeResponse {
 pub fn run() {
     let response = include_str!("../a.json");
     let payload: GithubTreeResponse = serde_json::from_str(&response).unwrap();
-    
+
     let mut ghfs = GithubFS::new();
     ghfs.add_repo(payload, "mTvare6".into(), "hello-world.rs".into());
 
     println!("{:?}", ghfs.nodes);
-
 }
 
+#[async_trait::async_trait]
+impl AsyncFilesystem for GithubFS {
+    async fn lookup(
+        &self,
+        _context: &RequestContext,
+        parent: INodeNo,
+        name: &OsStr,
+    ) -> fuser::experimental::Result<LookupResponse> {
+        let Some(Node::Dir(dir)) = self.nodes.get(&parent.0) else {
+            return Err(Errno::ENOENT);
+        };
 
+        let name_str = name.to_str().ok_or(Errno::EINVAL)?;
+        let file_ino = dir.files.get(name_str).ok_or(Errno::ENOENT)?;
+
+        let node = self.nodes.get(file_ino).ok_or(Errno::ENOENT)?;
+        let attr = node.attr(*file_ino);
+
+        Ok(LookupResponse::new(TTL, attr, fuser::Generation(0)))
+    }
+
+    async fn getattr(
+        &self,
+        _context: &RequestContext,
+        ino: INodeNo,
+        _file_handle: Option<FileHandle>,
+    ) -> fuser::experimental::Result<GetAttrResponse> {
+        let Some(node) = self.nodes.get(&ino.0) else {
+            return Err(Errno::ENOENT);
+        };
+
+        let attr = node.attr(ino.0);
+        Ok(GetAttrResponse::new(TTL, attr))
+    }
+
+    async fn read(
+        &self,
+        _context: &RequestContext,
+        ino: INodeNo,
+        _file_handle: FileHandle,
+        offset: u64,
+        _size: u32,
+        _flags: OpenFlags,
+        _lock: Option<LockOwner>,
+        out_data: &mut Vec<u8>,
+    ) -> fuser::experimental::Result<()> {
+        let Some(node) = self.nodes.get(&ino.0) else {
+            return Err(Errno::ENOENT);
+        };
+
+        let content = node.content().ok_or(Errno::EINVAL)?;
+        let content = content.as_bytes();
+        let offset = offset as usize;
+        if offset < content.len() {
+            out_data.extend_from_slice(&content[offset..]);
+        }
+        Ok(())
+    }
+
+    async fn readdir(
+        &self,
+        _context: &RequestContext,
+        ino: INodeNo,
+        _file_handle: FileHandle,
+        offset: u64,
+        mut builder: DirEntListBuilder<'_>,
+    ) -> fuser::experimental::Result<()> {
+        let Some(Node::Dir(dir)) = self.nodes.get(&ino.0) else {
+            return Err(Errno::ENOTDIR);
+        };
+
+        let mut entries = vec![
+            (ino.0, FileType::Directory, ".".to_string()),
+            (1, FileType::Directory, "..".to_string()), // hardcoding parent to root
+        ];
+
+        for (child_name, child_ino) in &dir.files {
+            let child_node = self.nodes.get(child_ino).unwrap();
+            let kind = match child_node {
+                Node::Dir(_) => FileType::Directory,
+                Node::File(_) => FileType::RegularFile,
+            };
+            entries.push((*child_ino, kind, child_name.clone()));
+        }
+
+        for (i, (child_ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
+            if builder.add(INodeNo(child_ino), (i + 1) as u64, kind, name) {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
