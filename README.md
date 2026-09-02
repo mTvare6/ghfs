@@ -1,12 +1,6 @@
 # ghfs
 
-A read-only FUSE filesystem that exposes GitHub as a directory tree. Users, repositories, and files are fetched lazily via the GitHub API and presented using FUSE as a frontend.
-
-### Features
-- Mounts at `/tmp/github`
-- Uses Github API for user/repo discovery with option for using `GITHUB_TOKEN`
-- File contents lazily hydrated
-- Lock free asyncfs using tokio for I/O
+A read-only tmpfs-type FUSE filesystem that represents GitHub as a directory tree. Users, repositories, and files are fetched lazily via the GitHub API (API token at `GITHUB_TOKEN` for queries) and presented at `/tmp/ghfs/`.
 
 ### Libraries
 - **Linux:** `sudo apt install libfuse3-dev` (or equivalent)
@@ -37,9 +31,3 @@ $ cd linux
 $ tree
 $ cat fs/fuse/file.c
 ```
-
-It auto unmounts cleanly when program is killed.
-
-### Caveats
-- Read-only mount
-- Cache is not invalidated during runtime (in-memory only)
