@@ -1,26 +1,42 @@
-use reqwest::{Client, ClientBuilder};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use reqwest::{Client, ClientBuilder, Url};
 use serde::Deserialize;
 use std::collections::HashMap;
 
 use std::ffi::OsStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
-use tokio::sync::{OnceCell, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 
-use fuser::experimental::{
-    AsyncFilesystem, DirEntListBuilder, GetAttrResponse, LookupResponse, RequestContext,
+use fuser::experimental::RequestContext;
+use fuser::{
+    BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
+    INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 
-use fuser::{Errno, FileAttr, FileHandle, FileType, INodeNo, LockOwner, OpenFlags};
-
 const TTL: Duration = Duration::from_secs(1);
+
+// SAFETY: very safe
+fn getuid() -> u32 {
+    unsafe { libc::getuid() }
+}
+
+// SAFETY: very safe
+fn getgid() -> u32 {
+    unsafe { libc::getgid() }
+}
 
 #[derive(Debug, Clone)]
 struct File {
     size: u64,
     url: String,
     cache: Arc<OnceCell<Vec<u8>>>,
+    sha: Option<String>,
+    dirty: bool,
+    name: String,
+    parent: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -49,44 +65,35 @@ enum Node {
 impl Node {
     fn attr(&self, ino: u64) -> FileAttr {
         let ino = INodeNo(ino);
-        match self {
-            Node::Dir(_) => FileAttr {
-                ino,
-                size: 0,
-                blocks: 0,
-                atime: UNIX_EPOCH,
-                mtime: UNIX_EPOCH,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
-                kind: FileType::Directory,
-                perm: 0o755,
-                nlink: 2,
-                uid: 501,
-                gid: 20,
-                rdev: 0,
-                flags: 0,
-                blksize: 512,
-            },
-            Node::File(file) => {
-                let size = file.size;
-                FileAttr {
-                    ino,
-                    size,
-                    blocks: 1,
-                    atime: UNIX_EPOCH,
-                    mtime: UNIX_EPOCH,
-                    ctime: UNIX_EPOCH,
-                    crtime: UNIX_EPOCH,
-                    kind: FileType::RegularFile,
-                    perm: 0o444,
-                    nlink: 1,
-                    uid: 501,
-                    gid: 20,
-                    rdev: 0,
-                    flags: 0,
-                    blksize: 512,
-                }
-            }
+        let (size, blocks, kind, perm, nlink) = match self {
+            Node::Dir(_) => (0, 0, FileType::Directory, 0o755, 2),
+            Node::File(file) => (file.size, 1, FileType::RegularFile, 0o644, 1),
+        };
+        let atime = UNIX_EPOCH;
+        let mtime = UNIX_EPOCH;
+        let ctime = UNIX_EPOCH;
+        let crtime = UNIX_EPOCH;
+        let gid = getgid();
+        let rdev = 0;
+        let flags = 0;
+        let blksize = 512;
+
+        FileAttr {
+            ino,
+            size,
+            blocks,
+            atime,
+            mtime,
+            ctime,
+            crtime,
+            kind,
+            perm,
+            nlink,
+            uid: getuid(),
+            gid,
+            rdev,
+            flags,
+            blksize,
         }
     }
 }
@@ -120,12 +127,14 @@ pub struct GithubFS {
     nodes: Arc<RwLock<HashMap<u64, Node>>>,
     needle: Arc<AtomicU64>,
     client: Client,
+    login: String,
+    operations: Mutex<()>,
 }
 
 impl GithubFS {
     const ROOT: u64 = 1;
 
-    pub fn new() -> Self {
+    pub async fn new() -> Self {
         let mut nodes = HashMap::new();
         let name = String::from("/tmp/github");
         let kind = DirKind::Root;
@@ -148,22 +157,40 @@ impl GithubFS {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("User-Agent", "rust-ghfs".parse().unwrap());
 
-        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-            let auth_value = format!("Bearer {}", token);
-            headers.insert("Authorization", auth_value.parse().unwrap());
-            println!("Using github token: {}", token);
-        }
+        let token = std::env::var("GH_TOKEN")
+            .or_else(|_| std::env::var("GITHUB_TOKEN"))
+            .expect("Set GH_TOKEN or GITHUB_TOKEN to a GitHub access token");
+        let auth_value = format!("Bearer {}", token);
+        let mut auth_value = reqwest::header::HeaderValue::from_str(&auth_value).unwrap();
+        auth_value.set_sensitive(true);
+        headers.insert("Authorization", auth_value);
 
         let client = ClientBuilder::new()
             .default_headers(headers)
             .build()
             .unwrap();
 
-        Self {
+        let user: GithubOwner = client
+            .get("https://api.github.com/user")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let fs = Self {
             nodes,
             needle,
             client,
-        }
+            login: user.login.clone(),
+            operations: Mutex::new(()),
+        };
+        fs.new_dir(Self::ROOT, user.login, DirKind::User, false)
+            .await;
+        fs
     }
 
     async fn find(&self, parent: u64, path_string: String) -> Option<u64> {
@@ -235,7 +262,8 @@ impl GithubFS {
         file
     }
 
-    pub async fn add_repo(&self, response: GithubTreeResponse, repo: u64) {
+    pub async fn add_repo(&self, mut response: GithubTreeResponse, repo: u64) {
+        response.tree.sort_by(|a, b| a.path.cmp(&b.path));
         for node in response.tree {
             match node.node_type {
                 GithubNodeType::Blob => {
@@ -245,7 +273,15 @@ impl GithubFS {
                         self.get_parent_and_node(repo, file_path).await.unwrap();
                     let url = node.url;
                     let cache = Arc::new(OnceCell::new());
-                    let file = File { size, url, cache };
+                    let file = File {
+                        size,
+                        url,
+                        cache,
+                        sha: Some(node.sha),
+                        dirty: false,
+                        name: file_name.clone(),
+                        parent,
+                    };
                     self.add_file(parent, file_name, file).await;
                 }
                 GithubNodeType::Tree => {
@@ -274,11 +310,13 @@ pub struct GithubNode {
     pub node_type: GithubNodeType,
     pub size: Option<u64>,
     pub url: String,
+    pub sha: String,
 }
 
 #[derive(Deserialize)]
 pub struct GithubTreeResponse {
     pub tree: Vec<GithubNode>,
+    pub truncated: bool,
 }
 
 #[derive(Deserialize)]
@@ -287,6 +325,7 @@ pub struct GithubRepoResponse {
     pub owner: GithubOwner,
     #[serde(rename = "default_branch")]
     pub branch: String,
+    pub size: u64,
 }
 
 #[derive(Deserialize)]
@@ -294,14 +333,14 @@ pub struct GithubOwner {
     pub login: String,
 }
 
-#[async_trait::async_trait]
-impl AsyncFilesystem for GithubFS {
+impl GithubFS {
     async fn lookup(
         &self,
         _context: &RequestContext,
         parent: INodeNo,
         name: &OsStr,
-    ) -> fuser::experimental::Result<LookupResponse> {
+    ) -> Result<FileAttr, Errno> {
+        self.hydrate(parent).await?;
         let name_str = name.to_str().ok_or(Errno::EINVAL)?;
         {
             let map = self.nodes.read().await;
@@ -314,7 +353,7 @@ impl AsyncFilesystem for GithubFS {
                 let node = map.get(file_ino).unwrap();
                 let attr = node.attr(*file_ino);
 
-                return Ok(LookupResponse::new(TTL, attr, fuser::Generation(0)));
+                return Ok(attr);
             }
         }
 
@@ -335,11 +374,7 @@ impl AsyncFilesystem for GithubFS {
                 let map = self.nodes.read().await;
                 let node = map.get(&new_id).unwrap();
 
-                return Ok(LookupResponse::new(
-                    TTL,
-                    node.attr(new_id),
-                    fuser::Generation(0),
-                ));
+                return Ok(node.attr(new_id));
             } else {
                 return Err(Errno::ENOENT);
             }
@@ -353,27 +388,23 @@ impl AsyncFilesystem for GithubFS {
         _context: &RequestContext,
         ino: INodeNo,
         _file_handle: Option<FileHandle>,
-    ) -> fuser::experimental::Result<GetAttrResponse> {
+    ) -> Result<FileAttr, Errno> {
         let map = self.nodes.read().await;
         let Some(node) = map.get(&ino.0) else {
             return Err(Errno::ENOENT);
         };
 
         let attr = node.attr(ino.0);
-        Ok(GetAttrResponse::new(TTL, attr))
+        Ok(attr)
     }
 
     async fn read(
         &self,
-        _context: &RequestContext,
         ino: INodeNo,
-        _file_handle: FileHandle,
         offset: u64,
-        _size: u32,
-        _flags: OpenFlags,
-        _lock: Option<LockOwner>,
+        size: u32,
         out_data: &mut Vec<u8>,
-    ) -> fuser::experimental::Result<()> {
+    ) -> Result<(), Errno> {
         let file = {
             let map = self.nodes.read().await;
             match map.get(&ino.0) {
@@ -382,69 +413,29 @@ impl AsyncFilesystem for GithubFS {
                 None => return Err(Errno::ENOENT),
             }
         };
-        // preventing rwlock from hanging the whole fs when content is being downloaded, so
-        // hashmap is lock-free by then
+        // preventing rwlock from hanging the whole fs when content is being downloaded,
+        // so hashmap is lock-free by then
 
         let content = file.content(&self.client).await?;
 
         let offset = offset as usize;
         if offset < content.len() {
-            out_data.extend_from_slice(&content[offset..]);
+            let end = offset.saturating_add(size as usize).min(content.len());
+            out_data.extend_from_slice(&content[offset..end]);
         }
 
         Ok(())
     }
 
-    async fn readdir(
-        &self,
-        _context: &RequestContext,
-        ino: INodeNo,
-        _file_handle: FileHandle,
-        offset: u64,
-        mut builder: DirEntListBuilder<'_>,
-    ) -> fuser::experimental::Result<()> {
-        let (kind, hydrated, name, parent) = {
+    async fn readdir(&self, ino: INodeNo) -> Result<Vec<(u64, FileType, String)>, Errno> {
+        self.hydrate(ino).await?;
+        let parent = {
             let map = self.nodes.read().await;
             let Some(Node::Dir(dir)) = map.get(&ino.0) else {
                 return Err(Errno::ENOTDIR);
             };
-            (dir.kind.clone(), dir.hydrated, dir.name.clone(), dir.parent)
+            dir.parent
         };
-
-        if !hydrated {
-            match kind {
-                DirKind::User => {
-                    let url = format!("https://api.github.com/users/{}/repos?per_page=100", name);
-                    let response = self.client.get(&url).send().await.map_err(|_| Errno::EIO)?;
-                    let repos: Vec<GithubRepoResponse> =
-                        response.json().await.map_err(|_| Errno::EIO)?;
-
-                    for repo in repos {
-                        let kind = DirKind::Repo {
-                            owner: repo.owner.login,
-                            branch: repo.branch,
-                        };
-                        let name = repo.name;
-                        self.new_dir(ino.0, name, kind, false).await;
-                    }
-                }
-                DirKind::Repo { owner, branch } => {
-                    let url = format!(
-                        "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
-                        owner, name, branch
-                    );
-                    let response = self.client.get(&url).send().await.map_err(|_| Errno::EIO)?;
-                    let tree: GithubTreeResponse = response.json().await.map_err(|_| Errno::EIO)?;
-                    self.add_repo(tree, ino.0).await;
-                }
-                _ => {}
-            }
-
-            let mut mmap = self.nodes.write().await;
-            if let Some(Node::Dir(dir)) = mmap.get_mut(&ino.0) {
-                dir.hydrated = true;
-            }
-        }
 
         let mut entries = vec![
             (ino.0, FileType::Directory, ".".to_string()),
@@ -465,12 +456,595 @@ impl AsyncFilesystem for GithubFS {
             entries.push((*child_ino, kind, child_name.clone()));
         }
 
-        for (i, (child_ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if builder.add(INodeNo(child_ino), (i + 1) as u64, kind, name) {
-                break;
+        entries[2..].sort_by(|a, b| a.2.cmp(&b.2));
+        Ok(entries)
+    }
+
+    async fn hydrate(&self, ino: INodeNo) -> Result<(), Errno> {
+        let _guard = self.operations.lock().await;
+        let (kind, hydrated, name) = {
+            let map = self.nodes.read().await;
+            let Some(Node::Dir(dir)) = map.get(&ino.0) else {
+                return Err(Errno::ENOTDIR);
+            };
+            (dir.kind.clone(), dir.hydrated, dir.name.clone())
+        };
+
+        if !hydrated {
+            match kind {
+                DirKind::User => {
+                    let url = if name.eq_ignore_ascii_case(&self.login) {
+                        String::from(
+                            "https://api.github.com/user/repos?affiliation=owner&per_page=100",
+                        )
+                    } else {
+                        format!("https://api.github.com/users/{}/repos?per_page=100", name)
+                    };
+                    let mut page = 1;
+                    loop {
+                        let response = self
+                            .client
+                            .get(&url)
+                            .query(&[("page", page)])
+                            .send()
+                            .await
+                            .map_err(|_| Errno::EIO)?
+                            .error_for_status()
+                            .map_err(|_| Errno::EIO)?;
+                        let repos: Vec<GithubRepoResponse> =
+                            response.json().await.map_err(|_| Errno::EIO)?;
+                        let done = repos.len() < 100;
+                        for repo in repos {
+                            let owner = repo.owner.login;
+                            let branch = repo.branch;
+                            let kind = DirKind::Repo { owner, branch };
+                            let name = repo.name;
+                            self.new_dir(ino.0, name, kind, false).await;
+                        }
+                        if done {
+                            break;
+                        }
+                        page += 1;
+                    }
+                }
+                DirKind::Repo { owner, branch } => {
+                    let mut url = Url::parse("https://api.github.com/repos/").unwrap();
+                    url.path_segments_mut()
+                        .unwrap()
+                        .pop_if_empty()
+                        .extend([&owner, &name, "git", "trees", &branch]);
+                    url.set_query(Some("recursive=1"));
+                    let response = self.client.get(url).send().await.map_err(|_| Errno::EIO)?;
+                    if response.status() == reqwest::StatusCode::CONFLICT {
+                        let url = format!("https://api.github.com/repos/{}/{}", owner, name);
+                        let repo: GithubRepoResponse = self
+                            .client
+                            .get(url)
+                            .send()
+                            .await
+                            .map_err(|_| Errno::EIO)?
+                            .error_for_status()
+                            .map_err(|_| Errno::EIO)?
+                            .json()
+                            .await
+                            .map_err(|_| Errno::EIO)?;
+
+                        if repo.size != 0 {
+                            return Err(Errno::EIO);
+                        }
+                    } else {
+                        let response = response.error_for_status().map_err(|_| Errno::EIO)?;
+                        let tree: GithubTreeResponse =
+                            response.json().await.map_err(|_| Errno::EIO)?;
+
+                        if tree.truncated {
+                            return Err(Errno::EFBIG);
+                        }
+                        self.add_repo(tree, ino.0).await;
+                    }
+                }
+                _ => {}
+            }
+
+            let mut mmap = self.nodes.write().await;
+            if let Some(Node::Dir(dir)) = mmap.get_mut(&ino.0) {
+                dir.hydrated = true;
             }
         }
 
         Ok(())
+    }
+
+    async fn file(&self, ino: INodeNo) -> Result<File, Errno> {
+        let map = self.nodes.read().await;
+        match map.get(&ino.0) {
+            Some(Node::File(file)) => Ok(file.clone()),
+            Some(Node::Dir(_)) => Err(Errno::EISDIR),
+            None => Err(Errno::ENOENT),
+        }
+    }
+
+    async fn push(
+        &self,
+        parent: u64,
+        name: &str,
+        sha: Option<&str>,
+        content: &[u8],
+    ) -> Result<GithubFileResponse, Errno> {
+        let (url, branch) = {
+            let map = self.nodes.read().await;
+            let mut needle = parent;
+            let mut path = vec![name.to_string()];
+
+            loop {
+                let Some(Node::Dir(dir)) = map.get(&needle) else {
+                    return Err(Errno::ENOTDIR);
+                };
+                if let DirKind::Repo { owner, branch } = &dir.kind {
+                    path.reverse();
+                    let mut url = Url::parse("https://api.github.com/repos/").unwrap();
+                    url.path_segments_mut()
+                        .unwrap()
+                        .pop_if_empty()
+                        .extend([owner.as_str(), &dir.name, "contents"])
+                        .extend(path.iter().map(String::as_str));
+                    break (url, branch.clone());
+                }
+                if !matches!(dir.kind, DirKind::Standard) {
+                    return Err(Errno::EACCES);
+                }
+                path.push(dir.name.clone());
+                needle = dir.parent;
+            }
+        };
+
+        let mut body = serde_json::json!({
+            "message": format!("add: {}", name),
+            "content": STANDARD.encode(content),
+            "branch": branch,
+        });
+
+        if let Some(sha) = sha {
+            body["sha"] = serde_json::json!(sha);
+        }
+
+        let response = self
+            .client
+            .put(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| Errno::EIO)?;
+
+        if !response.status().is_success() {
+            return Err(Errno::EIO);
+        }
+
+        let response: GithubWriteResponse = response.json().await.map_err(|_| Errno::EIO)?;
+        Ok(response.content)
+    }
+
+    async fn mkdir(&self, parent: INodeNo, name: &OsStr) -> Result<FileAttr, Errno> {
+        self.hydrate(parent).await?;
+        let _guard = self.operations.lock().await;
+        let name = name.to_str().ok_or(Errno::EINVAL)?;
+
+        let dir = {
+            let map = self.nodes.read().await;
+            let Some(Node::Dir(dir)) = map.get(&parent.0) else {
+                return Err(Errno::ENOTDIR);
+            };
+            if dir.files.contains_key(name) {
+                return Err(Errno::EEXIST);
+            }
+            dir.clone()
+        };
+
+        let kind = match dir.kind {
+            // todo: does ignore ascii work fine across unicode names
+            DirKind::User if dir.name.eq_ignore_ascii_case(&self.login) => {
+                let response = self
+                    .client
+                    .post("https://api.github.com/user/repos")
+                    .json(&serde_json::json!({"name": name}))
+                    .send()
+                    .await
+                    .map_err(|_| Errno::EIO)?
+                    .error_for_status()
+                    .map_err(|_| Errno::EIO)?;
+
+                let repo: GithubRepoResponse = response.json().await.map_err(|_| Errno::EIO)?;
+                let owner = repo.owner.login;
+                let branch = repo.branch;
+                DirKind::Repo { owner, branch }
+            }
+            DirKind::Repo { .. } | DirKind::Standard => DirKind::Standard,
+            _ => return Err(Errno::EACCES),
+        };
+
+        // Git tracks nested directories once they contain a file
+        let ino = self.new_dir(parent.0, name.into(), kind, true).await;
+        let map = self.nodes.read().await;
+        Ok(map.get(&ino).unwrap().attr(ino))
+    }
+
+    async fn create(&self, parent: INodeNo, name: &OsStr) -> Result<FileAttr, Errno> {
+        self.hydrate(parent).await?;
+        let _guard = self.operations.lock().await;
+        let name = name.to_str().ok_or(Errno::EINVAL)?;
+
+        {
+            let map = self.nodes.read().await;
+            let Some(Node::Dir(dir)) = map.get(&parent.0) else {
+                return Err(Errno::ENOTDIR);
+            };
+            if !matches!(dir.kind, DirKind::Repo { .. } | DirKind::Standard) {
+                return Err(Errno::EACCES);
+            }
+            if dir.files.contains_key(name) {
+                return Err(Errno::EEXIST);
+            }
+        }
+
+        let file = File {
+            size: 0,
+            url: String::new(),
+            sha: None,
+            dirty: true,
+            cache: Arc::new(OnceCell::new_with(Some(Vec::new()))),
+            name: name.into(),
+            parent: parent.0,
+        };
+
+        let ino = self.add_file(parent.0, name.into(), file).await;
+        let map = self.nodes.read().await;
+        Ok(map.get(&ino).unwrap().attr(ino))
+    }
+
+    async fn save(
+        &self,
+        ino: INodeNo,
+        mut file: File,
+        content: Vec<u8>,
+    ) -> Result<FileAttr, Errno> {
+        let response = self
+            .push(file.parent, &file.name, file.sha.as_deref(), &content)
+            .await?;
+
+        file.size = content.len() as u64;
+        file.sha = Some(response.sha);
+        file.dirty = false;
+        file.url = response.git_url;
+        file.cache = Arc::new(OnceCell::new_with(Some(content)));
+
+        let node = Node::File(file);
+        let attr = node.attr(ino.0);
+        let mut map = self.nodes.write().await;
+
+        map.insert(ino.0, node);
+        Ok(attr)
+    }
+
+    async fn write(&self, ino: INodeNo, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+        let _guard = self.operations.lock().await;
+        let file = self.file(ino).await?;
+
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        let offset = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+        let end = offset.checked_add(data.len()).ok_or(Errno::EFBIG)?;
+        let mut content = file.content(&self.client).await?.to_vec();
+
+        if end > content.len() {
+            content
+                .try_reserve(end - content.len())
+                .map_err(|_| Errno::EFBIG)?;
+            content.resize(end, 0);
+        }
+        content[offset..end].copy_from_slice(data);
+        self.save(ino, file, content).await?;
+        Ok(data.len() as u32)
+    }
+
+    async fn truncate(&self, ino: INodeNo, size: u64) -> Result<FileAttr, Errno> {
+        let _guard = self.operations.lock().await;
+        let mut file = self.file(ino).await?;
+        let size = usize::try_from(size).map_err(|_| Errno::EFBIG)?;
+
+        let mut content = if size == 0 {
+            Vec::new()
+        } else {
+            file.content(&self.client).await?.to_vec()
+        };
+
+        if size > content.len() {
+            content
+                .try_reserve(size - content.len())
+                .map_err(|_| Errno::EFBIG)?;
+        }
+
+        content.resize(size, 0);
+        file.size = size as u64;
+        file.cache = Arc::new(OnceCell::new_with(Some(content)));
+        file.dirty = true;
+
+        let node = Node::File(file);
+        let attr = node.attr(ino.0);
+        let mut map = self.nodes.write().await;
+        map.insert(ino.0, node);
+        Ok(attr)
+    }
+
+    async fn flush(&self, ino: INodeNo) -> Result<(), Errno> {
+        let _guard = self.operations.lock().await;
+        let file = self.file(ino).await?;
+
+        if file.dirty {
+            let content = file.content(&self.client).await?.to_vec();
+            self.save(ino, file, content).await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+struct GithubWriteResponse {
+    content: GithubFileResponse,
+}
+
+#[derive(Deserialize)]
+struct GithubFileResponse {
+    sha: String,
+    git_url: String,
+}
+
+pub struct TokioAdapter {
+    inner: Arc<GithubFS>,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl TokioAdapter {
+    pub fn new() -> Self {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let inner = Arc::new(runtime.block_on(GithubFS::new()));
+
+        Self { inner, runtime }
+    }
+}
+
+impl Filesystem for TokioAdapter {
+    fn lookup(&self, context: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let context: RequestContext = context.into();
+        let name = name.to_os_string();
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            match inner.lookup(&context, parent, &name).await {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn getattr(
+        &self,
+        context: &Request,
+        ino: INodeNo,
+        file_handle: Option<FileHandle>,
+        reply: ReplyAttr,
+    ) {
+        let context: RequestContext = context.into();
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            match inner.getattr(&context, ino, file_handle).await {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn read(
+        &self,
+        _context: &Request,
+        ino: INodeNo,
+        _file_handle: FileHandle,
+        offset: u64,
+        size: u32,
+        _flags: OpenFlags,
+        _lock: Option<LockOwner>,
+        reply: ReplyData,
+    ) {
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            let mut out_data = Vec::new();
+            match inner.read(ino, offset, size, &mut out_data).await {
+                Ok(()) => reply.data(&out_data),
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn readdir(
+        &self,
+        _context: &Request,
+        ino: INodeNo,
+        _file_handle: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        let inner = self.inner.clone();
+        self.runtime.spawn(async move {
+            match inner.readdir(ino).await {
+                Ok(entries) => {
+                    for (i, (child_ino, kind, name)) in
+                        entries.into_iter().enumerate().skip(offset as usize)
+                    {
+                        if reply.add(INodeNo(child_ino), (i + 1) as u64, kind, name) {
+                            break;
+                        }
+                    }
+                    reply.ok();
+                }
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn open(&self, _context: &Request, _ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        reply.opened(FileHandle(0), FopenFlags::FOPEN_DIRECT_IO);
+    }
+
+    fn mkdir(
+        &self,
+        _context: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let name = name.to_os_string();
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            match inner.mkdir(parent, &name).await {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn create(
+        &self,
+        _context: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let name = name.to_os_string();
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            match inner.create(parent, &name).await {
+                Ok(attr) => reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(0),
+                    FopenFlags::FOPEN_DIRECT_IO,
+                ),
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn write(
+        &self,
+        _context: &Request,
+        ino: INodeNo,
+        _file_handle: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let data = data.to_vec();
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            match inner.write(ino, offset, &data).await {
+                Ok(size) => reply.written(size),
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn setattr(
+        &self,
+        context: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        _mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        file_handle: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let context: RequestContext = context.into();
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            let result = async {
+                let attr = inner.getattr(&context, ino, file_handle).await?;
+                if mode.is_some_and(|mode| mode & 0o777 != u32::from(attr.perm))
+                    || uid.is_some_and(|uid| uid != attr.uid)
+                    || gid.is_some_and(|gid| gid != attr.gid)
+                {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                match size {
+                    Some(size) => inner.truncate(ino, size).await,
+                    None => Ok(attr),
+                }
+            }
+            .await;
+
+            match result {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn flush(
+        &self,
+        _context: &Request,
+        ino: INodeNo,
+        _file_handle: FileHandle,
+        _lock: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            match inner.flush(ino).await {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn fsync(
+        &self,
+        _context: &Request,
+        ino: INodeNo,
+        _file_handle: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            match inner.flush(ino).await {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(error),
+            }
+        });
     }
 }
