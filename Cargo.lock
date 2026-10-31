@@ -12,17 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-trait"
-version = "0.1.89"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -162,7 +151,6 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "80a5eca878900c2e39e9e52fd797954b7fc39eeefc8558257114bfea6a698fcf"
 dependencies = [
- "async-trait",
  "bitflags 2.11.0",
  "libc",
  "log",
@@ -174,7 +162,6 @@ dependencies = [
  "pkg-config",
  "ref-cast",
  "smallvec",
- "tokio",
  "zerocopy",
 ]
 
@@ -232,7 +219,6 @@ dependencies = [
 name = "ghfs"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "base64",
  "env_logger",
  "fuser",
@@ -1037,19 +1023,7 @@ dependencies = [
  "mio",
  "pin-project-lite",
  "socket2 0.6.3",
- "tokio-macros",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "tokio-macros"
-version = "2.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c55a2eff8b69ce66c84f85e1da1c233edc36ceb85a2058d11b0d6a3c7e7569c"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
