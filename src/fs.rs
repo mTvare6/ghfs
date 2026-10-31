@@ -11,8 +11,8 @@ use tokio::sync::{Mutex, OnceCell, RwLock};
 
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
-    INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 
 const TTL: Duration = Duration::from_secs(1);
@@ -94,12 +94,10 @@ impl File {
         let bytes = self
             .cache
             .get_or_try_init(|| async {
-                let response = client
+                let request = client
                     .get(&self.url)
-                    .header("Accept", "application/vnd.github.v3.raw")
-                    .send()
-                    .await
-                    .map_err(|_| Errno::EIO)?;
+                    .header("Accept", "application/vnd.github.v3.raw");
+                let response = request.send().await.map_err(|_| Errno::EIO)?;
 
                 if !response.status().is_success() {
                     return Err(Errno::EIO);
@@ -146,31 +144,21 @@ impl GithubFS {
         let needle = AtomicU64::new(1);
 
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("User-Agent", "rust-ghfs".parse().unwrap());
+        headers.insert("User-Agent", "ghfs".parse().unwrap());
 
-        let token = std::env::var("GH_TOKEN")
-            .or_else(|_| std::env::var("GITHUB_TOKEN"))
-            .expect("Set GH_TOKEN or GITHUB_TOKEN to a GitHub access token");
+        let token = std::env::var("GITHUB_TOKEN").expect("Set GITHUB_TOKEN to access Github");
         let auth_value = format!("Bearer {}", token);
         let mut auth_value = reqwest::header::HeaderValue::from_str(&auth_value).unwrap();
         auth_value.set_sensitive(true);
         headers.insert("Authorization", auth_value);
 
-        let client = ClientBuilder::new()
-            .default_headers(headers)
-            .build()
-            .unwrap();
+        let builder = ClientBuilder::new().default_headers(headers);
+        let client = builder.build().unwrap();
 
-        let user: GithubOwner = client
-            .get("https://api.github.com/user")
-            .send()
-            .await
-            .unwrap()
-            .error_for_status()
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let request = client.get("https://api.github.com/user");
+        let response = request.send().await.unwrap();
+        let response = response.error_for_status().unwrap();
+        let user: GithubOwner = response.json().await.unwrap();
 
         let fs = Self {
             nodes,
@@ -231,6 +219,7 @@ impl GithubFS {
 
     pub async fn add_repo(&self, mut response: GithubTreeResponse, repo: u64) {
         response.tree.sort_by(|a, b| a.path.cmp(&b.path));
+
         for node in response.tree {
             match node.node_type {
                 GithubNodeType::Blob => {
@@ -278,6 +267,7 @@ pub struct GithubNode {
     pub size: Option<u64>,
     pub url: String,
     pub sha: String,
+    pub mode: String,
 }
 
 #[derive(Deserialize)]
@@ -321,12 +311,8 @@ impl GithubFS {
 
         if parent.0 == GithubFS::ROOT {
             let user = format!("https://api.github.com/users/{}", name_str);
-            let response = self
-                .client
-                .get(&user)
-                .send()
-                .await
-                .map_err(|_| Errno::EIO)?;
+            let request = self.client.get(&user);
+            let response = request.send().await.map_err(|_| Errno::EIO)?;
 
             if response.status().is_success() {
                 let new_id = self
@@ -420,15 +406,9 @@ impl GithubFS {
                     };
                     let mut page = 1;
                     loop {
-                        let response = self
-                            .client
-                            .get(&url)
-                            .query(&[("page", page)])
-                            .send()
-                            .await
-                            .map_err(|_| Errno::EIO)?
-                            .error_for_status()
-                            .map_err(|_| Errno::EIO)?;
+                        let request = self.client.get(&url).query(&[("page", page)]);
+                        let response = request.send().await.map_err(|_| Errno::EIO)?;
+                        let response = response.error_for_status().map_err(|_| Errno::EIO)?;
                         let repos: Vec<GithubRepoResponse> =
                             response.json().await.map_err(|_| Errno::EIO)?;
                         let done = repos.len() < 100;
@@ -455,17 +435,11 @@ impl GithubFS {
                     let response = self.client.get(url).send().await.map_err(|_| Errno::EIO)?;
                     if response.status() == reqwest::StatusCode::CONFLICT {
                         let url = format!("https://api.github.com/repos/{}/{}", owner, name);
-                        let repo: GithubRepoResponse = self
-                            .client
-                            .get(url)
-                            .send()
-                            .await
-                            .map_err(|_| Errno::EIO)?
-                            .error_for_status()
-                            .map_err(|_| Errno::EIO)?
-                            .json()
-                            .await
-                            .map_err(|_| Errno::EIO)?;
+                        let request = self.client.get(url);
+                        let response = request.send().await.map_err(|_| Errno::EIO)?;
+                        let response = response.error_for_status().map_err(|_| Errno::EIO)?;
+                        let repo: GithubRepoResponse =
+                            response.json().await.map_err(|_| Errno::EIO)?;
 
                         if repo.size != 0 {
                             return Err(Errno::EIO);
@@ -502,7 +476,7 @@ impl GithubFS {
         }
     }
 
-    async fn contents_url(&self, parent: u64, name: &str) -> Result<(Url, String), Errno> {
+    async fn repo_path(&self, parent: u64, name: &str) -> Result<(Url, String, String), Errno> {
         let map = self.nodes.read().await;
         let mut needle = parent;
         let mut path = vec![name.to_string()];
@@ -511,22 +485,34 @@ impl GithubFS {
             let Some(Node::Dir(dir)) = map.get(&needle) else {
                 return Err(Errno::ENOTDIR);
             };
+
             if let DirKind::Repo { owner, branch } = &dir.kind {
                 path.reverse();
                 let mut url = Url::parse("https://api.github.com/repos/").unwrap();
-                url.path_segments_mut()
-                    .unwrap()
-                    .pop_if_empty()
-                    .extend([owner.as_str(), &dir.name, "contents"])
-                    .extend(path.iter().map(String::as_str));
-                return Ok((url, branch.clone()));
+                let path = [owner.as_str(), &dir.name, ""];
+                url.path_segments_mut().unwrap().pop_if_empty().extend(path);
+                return Ok((url, branch.clone(), path.join("/")));
             }
+
             if !matches!(dir.kind, DirKind::Standard) {
                 return Err(Errno::EACCES);
             }
+
             path.push(dir.name.clone());
             needle = dir.parent;
         }
+    }
+
+    async fn contents_url(&self, parent: u64, name: &str) -> Result<(Url, String), Errno> {
+        let (mut url, branch, path) = self.repo_path(parent, name).await?;
+
+        url.path_segments_mut()
+            .unwrap()
+            .pop_if_empty()
+            .push("contents")
+            .extend(path.split('/'));
+
+        Ok((url, branch))
     }
 
     async fn push(
@@ -549,13 +535,8 @@ impl GithubFS {
             body["sha"] = serde_json::json!(sha);
         }
 
-        let response = self
-            .client
-            .put(url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|_| Errno::EIO)?;
+        let request = self.client.put(url).json(&body);
+        let response = request.send().await.map_err(|_| Errno::EIO)?;
 
         if !response.status().is_success() {
             return Err(Errno::EIO);
@@ -584,15 +565,12 @@ impl GithubFS {
         let kind = match dir.kind {
             // todo: does ignore ascii work fine across unicode names
             DirKind::User if dir.name.eq_ignore_ascii_case(&self.login) => {
-                let response = self
+                let request = self
                     .client
                     .post("https://api.github.com/user/repos")
-                    .json(&serde_json::json!({"name": name}))
-                    .send()
-                    .await
-                    .map_err(|_| Errno::EIO)?
-                    .error_for_status()
-                    .map_err(|_| Errno::EIO)?;
+                    .json(&serde_json::json!({"name": name}));
+                let response = request.send().await.map_err(|_| Errno::EIO)?;
+                let response = response.error_for_status().map_err(|_| Errno::EIO)?;
 
                 let repo: GithubRepoResponse = response.json().await.map_err(|_| Errno::EIO)?;
                 let owner = repo.owner.login;
@@ -653,6 +631,7 @@ impl GithubFS {
             matches!(map.get(&file.parent), Some(Node::Dir(dir))
                 if dir.files.get(&file.name) == Some(&ino.0))
         };
+
         if linked {
             let response = self
                 .push(file.parent, &file.name, file.sha.as_deref(), &content)
@@ -725,10 +704,256 @@ impl GithubFS {
         Ok(attr)
     }
 
+    async fn rename(
+        &self,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+    ) -> Result<(), Errno> {
+        self.hydrate(parent).await?;
+        self.hydrate(newparent).await?;
+
+        let _guard = self.operations.lock().await;
+        let name = name.to_str().ok_or(Errno::EINVAL)?;
+        let newname = newname.to_str().ok_or(Errno::EINVAL)?;
+
+        let (ino, mut node, target) = {
+            let map = self.nodes.read().await;
+            let Some(Node::Dir(dir)) = map.get(&parent.0) else {
+                return Err(Errno::ENOTDIR);
+            };
+            let ino = *dir.files.get(name).ok_or(Errno::ENOENT)?;
+            let node = map.get(&ino).ok_or(Errno::ENOENT)?.clone();
+            let Some(Node::Dir(dir)) = map.get(&newparent.0) else {
+                return Err(Errno::ENOTDIR);
+            };
+            let target = dir.files.get(newname).and_then(|ino| map.get(ino)).cloned();
+            (ino, node, target)
+        };
+
+        // the other two aren't supported (atomic/exchange)
+        // !empty ~ noreplace
+        if !flags.is_empty() {
+            #[cfg(target_os = "linux")]
+            {
+                if flags != RenameFlags::RENAME_NOREPLACE {
+                    return Err(Errno::EOPNOTSUPP);
+                }
+                if target.is_some() {
+                    return Err(Errno::EEXIST);
+                }
+            }
+
+            // mac
+            #[cfg(not(target_os = "linux"))]
+            return Err(Errno::EOPNOTSUPP);
+        }
+
+        let (base, branch, oldpath) = self.repo_path(parent.0, name).await?;
+        let (newbase, newbranch, newpath) = self.repo_path(newparent.0, newname).await?;
+
+        if base != newbase || branch != newbranch {
+            return Err(Errno::EXDEV);
+        }
+
+        if parent == newparent && name == newname {
+            return Ok(());
+        }
+
+        let directory = matches!(node, Node::Dir(_));
+        if let Node::Dir(dir) = &node {
+            if !matches!(dir.kind, DirKind::Standard) {
+                return Err(Errno::EACCES);
+            }
+            if newpath.starts_with(&format!("{}/", oldpath)) {
+                return Err(Errno::EINVAL);
+            }
+        }
+
+        match (&node, &target) {
+            (Node::File(_), Some(Node::Dir(_))) => return Err(Errno::EISDIR),
+            (Node::Dir(_), Some(Node::File(_))) => return Err(Errno::ENOTDIR),
+            (_, Some(Node::Dir(dir))) if !dir.files.is_empty() => return Err(Errno::ENOTEMPTY),
+            _ => {}
+        }
+
+        let persisted = {
+            let map = self.nodes.read().await;
+            let mut pending = vec![ino];
+            let mut persisted = false;
+            while let Some(ino) = pending.pop() {
+                match map.get(&ino).ok_or(Errno::ENOENT)? {
+                    Node::File(file) => persisted |= file.sha.is_some(),
+                    Node::Dir(dir) => pending.extend(dir.files.values().copied()),
+                }
+            }
+            persisted
+        };
+
+        if !persisted {
+            if let Node::File(file) = &mut node {
+                let sha = match &target {
+                    Some(Node::File(file)) => file.sha.as_deref(),
+                    _ => None,
+                };
+                let content = file.content(&self.client).await?;
+                let response = self.push(newparent.0, newname, sha, content).await?;
+                file.sha = Some(response.sha);
+                file.url = response.git_url;
+                file.dirty = false;
+            }
+        } else {
+            let mut reference = base.join("git/ref/heads/").unwrap();
+            reference
+                .path_segments_mut()
+                .unwrap()
+                .pop_if_empty()
+                .extend(branch.split('/'));
+
+            let request = self.client.get(reference);
+            let response = request.send().await.map_err(|_| Errno::EIO)?;
+            let response = response.error_for_status().map_err(|_| Errno::EIO)?;
+
+            let head: GithubReference = response.json().await.map_err(|_| Errno::EIO)?;
+            let head = head.object.sha;
+            let url = base.join(&format!("git/commits/{}", head)).unwrap();
+            let request = self.client.get(url);
+            let response = request.send().await.map_err(|_| Errno::EIO)?;
+            let response = response.error_for_status().map_err(|_| Errno::EIO)?;
+            let commit: GithubCommit = response.json().await.map_err(|_| Errno::EIO)?;
+
+            let mut url = base
+                .join(&format!("git/trees/{}", commit.tree.sha))
+                .unwrap();
+            url.set_query(Some("recursive=1"));
+            let request = self.client.get(url);
+            let response = request.send().await.map_err(|_| Errno::EIO)?;
+            let response = response.error_for_status().map_err(|_| Errno::EIO)?;
+
+            let tree: GithubTreeResponse = response.json().await.map_err(|_| Errno::EIO)?;
+            if tree.truncated {
+                return Err(Errno::EFBIG);
+            }
+
+            let source = tree
+                .tree
+                .iter()
+                .find(|entry| entry.path == oldpath)
+                .ok_or(Errno::EAGAIN)?;
+
+            let destination = tree.tree.iter().find(|entry| entry.path == newpath);
+            let expected = match &target {
+                Some(Node::File(file)) => file.sha.as_deref(),
+                _ => None,
+            };
+
+            if destination.map(|entry| entry.sha.as_str()) != expected {
+                return Err(Errno::EAGAIN);
+            }
+
+            let mut sha = source.sha.clone();
+            if let Node::File(file) = &node {
+                if file.sha.as_deref() != Some(source.sha.as_str()) {
+                    return Err(Errno::EAGAIN);
+                }
+                if file.dirty {
+                    let content = file.content(&self.client).await?;
+                    let blob: GithubObject = self.client.post(base.join("git/blobs").unwrap())
+                        .json(&serde_json::json!({"content": STANDARD.encode(content), "encoding": "base64"}))
+                        .send().await.map_err(|_| Errno::EIO)?.error_for_status().map_err(|_| Errno::EIO)?
+                        .json().await.map_err(|_| Errno::EIO)?;
+                    sha = blob.sha;
+                }
+            }
+            let kind = if directory { "tree" } else { "blob" };
+            let changes = serde_json::json!([
+                {"path": oldpath, "mode": source.mode, "type": kind, "sha": null},
+                {"path": newpath, "mode": source.mode, "type": kind, "sha": sha},
+            ]);
+            let url = base.join("git/trees").unwrap();
+            let body = serde_json::json!({"base_tree": commit.tree.sha, "tree": changes});
+            let request = self.client.post(url).json(&body);
+            let response = request.send().await.map_err(|_| Errno::EIO)?;
+            let response = response.error_for_status().map_err(|_| Errno::EIO)?;
+            let tree: GithubObject = response.json().await.map_err(|_| Errno::EIO)?;
+
+            let message = if target.is_some() && !directory {
+                // olds gone
+                format!("update: {}", newpath)
+            } else {
+                format!("move: {} -> {}", oldpath, newpath)
+            };
+
+            let url = base.join("git/commits").unwrap();
+            let body = serde_json::json!({"message": message, "tree": tree.sha, "parents": [head]});
+            let request = self.client.post(url).json(&body);
+            let response = request.send().await.map_err(|_| Errno::EIO)?;
+            let response = response.error_for_status().map_err(|_| Errno::EIO)?;
+
+            let commit: GithubObject = response.json().await.map_err(|_| Errno::EIO)?;
+            let mut reference = base.join("git/refs/heads/").unwrap();
+
+            reference
+                .path_segments_mut()
+                .unwrap()
+                .pop_if_empty()
+                .extend(branch.split('/'));
+
+            let body = serde_json::json!({"sha": commit.sha, "force": false});
+            let request = self.client.patch(reference).json(&body);
+            let response = request.send().await.map_err(|_| Errno::EIO)?;
+
+            if matches!(
+                response.status(),
+                reqwest::StatusCode::CONFLICT | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+            ) {
+                return Err(Errno::EAGAIN);
+            }
+
+            response.error_for_status().map_err(|_| Errno::EIO)?;
+
+            if let Node::File(file) = &mut node {
+                file.url = base.join(&format!("git/blobs/{}", sha)).unwrap().into();
+                file.sha = Some(sha);
+                file.dirty = false;
+            }
+        }
+
+        match &mut node {
+            Node::File(file) => {
+                file.parent = newparent.0;
+                file.name = newname.into();
+            }
+            Node::Dir(dir) => {
+                dir.parent = newparent.0;
+                dir.name = newname.into();
+            }
+        }
+
+        let mut map = self.nodes.write().await;
+
+        let Some(Node::Dir(dir)) = map.get_mut(&parent.0) else {
+            return Err(Errno::ENOTDIR);
+        };
+
+        dir.files.remove(name);
+
+        let Some(Node::Dir(dir)) = map.get_mut(&newparent.0) else {
+            return Err(Errno::ENOTDIR);
+        };
+
+        dir.files.insert(newname.into(), ino);
+        map.insert(ino, node);
+        Ok(())
+    }
+
     async fn unlink(&self, parent: INodeNo, name: &OsStr) -> Result<(), Errno> {
         self.hydrate(parent).await?;
         let _guard = self.operations.lock().await;
         let name = name.to_str().ok_or(Errno::EINVAL)?;
+
         let ino = {
             let map = self.nodes.read().await;
             let Some(Node::Dir(dir)) = map.get(&parent.0) else {
@@ -736,7 +961,9 @@ impl GithubFS {
             };
             *dir.files.get(name).ok_or(Errno::ENOENT)?
         };
+
         let file = self.file(INodeNo(ino)).await?;
+
         if let Some(sha) = file.sha {
             let (url, branch) = self.contents_url(parent.0, name).await?;
             let body = serde_json::json!({
@@ -744,14 +971,9 @@ impl GithubFS {
                 "sha": sha,
                 "branch": branch,
             });
-            self.client
-                .delete(url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|_| Errno::EIO)?
-                .error_for_status()
-                .map_err(|_| Errno::EIO)?;
+            let request = self.client.delete(url).json(&body);
+            let response = request.send().await.map_err(|_| Errno::EIO)?;
+            response.error_for_status().map_err(|_| Errno::EIO)?;
         }
 
         let mut map = self.nodes.write().await;
@@ -759,12 +981,14 @@ impl GithubFS {
             return Err(Errno::ENOTDIR);
         };
         dir.files.remove(name);
-        // keep the inode for open handles; save() checks whether it is still linked
+        // keep the inode for open handles
+        // save() checks whether it is still linked
         Ok(())
     }
 
     async fn rmdir(&self, parent: INodeNo, name: &OsStr) -> Result<(), Errno> {
         self.hydrate(parent).await?;
+
         let name = name.to_str().ok_or(Errno::EINVAL)?;
         let ino = {
             let map = self.nodes.read().await;
@@ -780,6 +1004,7 @@ impl GithubFS {
             }
             ino
         };
+
         self.hydrate(INodeNo(ino)).await?;
         let _guard = self.operations.lock().await;
         let dir = {
@@ -792,19 +1017,16 @@ impl GithubFS {
             }
             dir.clone()
         };
+
         if let DirKind::Repo { owner, .. } = dir.kind {
             let mut url = Url::parse("https://api.github.com/repos/").unwrap();
             url.path_segments_mut()
                 .unwrap()
                 .pop_if_empty()
                 .extend([&owner, &dir.name]);
-            self.client
-                .delete(url)
-                .send()
-                .await
-                .map_err(|_| Errno::EIO)?
-                .error_for_status()
-                .map_err(|_| Errno::EIO)?;
+            let request = self.client.delete(url);
+            let response = request.send().await.map_err(|_| Errno::EIO)?;
+            response.error_for_status().map_err(|_| Errno::EIO)?;
         }
 
         let mut map = self.nodes.write().await;
@@ -837,6 +1059,21 @@ struct GithubWriteResponse {
 struct GithubFileResponse {
     sha: String,
     git_url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubObject {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct GithubReference {
+    object: GithubObject,
+}
+
+#[derive(Deserialize)]
+struct GithubCommit {
+    tree: GithubObject,
 }
 
 pub struct TokioAdapter {
@@ -1043,6 +1280,31 @@ impl Filesystem for TokioAdapter {
 
             match result {
                 Ok(attr) => reply.attr(&TTL, &attr),
+                Err(error) => reply.error(error),
+            }
+        });
+    }
+
+    fn rename(
+        &self,
+        _context: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let name = name.to_os_string();
+        let newname = newname.to_os_string();
+        let inner = self.inner.clone();
+
+        self.runtime.spawn(async move {
+            match inner
+                .rename(parent, &name, newparent, &newname, flags)
+                .await
+            {
+                Ok(()) => reply.ok(),
                 Err(error) => reply.error(error),
             }
         });
